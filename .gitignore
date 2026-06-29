@@ -1,0 +1,16 @@
+# Secrets / local env
+.dev.vars
+.env
+.env.*
+!.dev.vars.example
+
+# Dependencies
+node_modules/
+
+# Build / Wrangler
+dist/
+.wrangler/
+
+# Logs / OS
+*.log
+.DS_Store

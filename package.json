@@ -1,0 +1,24 @@
+{
+  "name": "notion-summarizer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Notion ページ更新を要約して Slack に投稿する Cloudflare Workers Bot",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "format": "biome format --write .",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
+    "@cloudflare/workers-types": "^4.20240909.0",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.8",
+    "wrangler": "^3.90.0"
+  }
+}

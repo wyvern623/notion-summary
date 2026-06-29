@@ -1,0 +1,19 @@
+# ローカル開発用 Secrets テンプレート。
+# このファイルをコピーして `.dev.vars` を作り、実値を設定する。
+# `.dev.vars` は .gitignore 済み。実値は絶対にコミットしない。
+
+# Notion インテグレーショントークン
+NOTION_API_TOKEN=""
+
+# Notion Webhook 署名検証用トークン (初回 verification_token の値)
+# 通常イベントの署名検証に必須。未設定だと通常イベントは fail-closed で 500 になる。
+NOTION_WEBHOOK_TOKEN=""
+
+# Gemini API キー
+GEMINI_API_KEY=""
+
+# Slack Bot OAuth トークン
+SLACK_BOT_TOKEN=""
+
+# 要約投稿先チャンネル ID (カンマ区切りで複数可)
+SLACK_SUMMARY_CHANNEL_ID=""

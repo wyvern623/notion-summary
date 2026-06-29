@@ -1,0 +1,44 @@
+name = "notion-summarizer"
+main = "src/index.ts"
+compatibility_date = "2026-06-29"
+compatibility_flags = ["nodejs_compat"]
+
+# --- 非機密の設定値 (spec §14 Workers vars) ---
+# 機密値 (NOTION_API_TOKEN / NOTION_WEBHOOK_TOKEN / GEMINI_API_KEY /
+# SLACK_BOT_TOKEN / SLACK_SUMMARY_CHANNEL_ID) は `wrangler secret put` で設定する。
+# ここには絶対に書かない。
+[vars]
+NOTION_VERSION = "2022-06-28"
+NOTION_EVENT_TYPES = "page.content_updated,page.created"
+SUMMARY_DELAY_SECONDS = "600"
+GEMINI_MODEL = "gemini-2.5-flash-lite"
+SUMMARY_LENGTH = "medium"
+SUMMARY_STYLE = "bullet"
+NOTION_PAGE_SIZE = "100"
+NOTION_MAX_BLOCK_FETCHES = "40"
+NOTION_MAX_BLOCKS = "800"
+NOTION_MAX_MARKDOWN_CHARS = "30000"
+LOG_LEVEL = "INFO"
+DEBUG_VERBOSE = "false"
+# Queue consumer の max_retries と一致させる (下の [[queues.consumers]] 参照)
+QUEUE_MAX_RETRIES = "3"
+
+# --- Queue producer: Webhook 受付時に要約ジョブを投入 ---
+[[queues.producers]]
+binding = "SUMMARY_QUEUE"
+queue = "notion-summary-queue"
+
+# --- Queue consumer: 要約ジョブを実行 ---
+[[queues.consumers]]
+queue = "notion-summary-queue"
+max_batch_size = 1
+max_batch_timeout = 5
+max_retries = 3
+
+# --- D1: デバウンス状態・実行履歴・要約結果 ---
+# database_id は `wrangler d1 create notion-summarizer-db` で発行した実 ID に差し替える。
+[[d1_databases]]
+binding = "DB"
+database_name = "notion-summarizer-db"
+database_id = "<cloudflare-d1-database-id>"
+migrations_dir = "migrations"
