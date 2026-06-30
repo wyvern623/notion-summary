@@ -1,144 +1,116 @@
 /**
- * Queue Consumer (spec §7 / 計画 §4-B, §4-C)。
+ * 要約処理 (Cron 駆動・無料構成 / spec §7 を Cron+D1 へ移植)。
  *
- * 1 メッセージ = 1 要約ジョブ。冪等性と retry を D1 + message.attempts で担保する。
+ * Cron Trigger が定期実行され、`Db.getDuePages` で「debounce_until を過ぎた pending ページ」を
+ * 拾い、各ページに対して本関数を呼ぶ。Queue は使わず、遅延・再試行は D1 で表現する。
  *
- * 主な分岐:
- *   - page_id なし          → job failed, ack
- *   - newer_edit            → job skipped, ack (page_state は新しいジョブが所有するので触らない)
- *   - debounce 中           → 残り秒数 delay で再 Queue 投入, ack
- *   - lock 取得失敗          → 短時間 delay で再 Queue 投入, ack
- *   - 取得後 newer_edit      → skipped
- *   - 本文が空              → skipped empty_body
- *   - Gemini permanent      → failed (Slack 投稿しない)
- *   - Slack 一部失敗        → retryable (未投稿チャンネルだけ次回投稿)
- *   - 完了                  → completed
+ * 1 ページの処理:
+ *   - processing lock を取得 (取れなければ別実行が処理中 → 今回はスキップ、次 tick で再試行)
+ *   - ページ再取得 → 現在の last_edited_time が D1 と異なれば newer_edit としてスキップ
+ *   - 本文取得 → 空なら empty_body スキップ
+ *   - Gemini 要約 (permanent エラーは Slack 投稿せず failed)
+ *   - Slack 投稿 (チャンネル単位で冪等 / 一部失敗は retry)
+ *   - 完了で completed
  *
- * retry 方針 (§4-B): notion retryable / gemini transient / slack 未完了 は
- *   message.attempts < maxRetries なら message.retry()、最終試行なら failed を記録して ack。
+ * retry 方針 (D1 retry_count ベース):
+ *   notion retryable / gemini transient / slack 未完了 などの一時失敗は
+ *   retry_count < maxRetries なら bumpRetry で pending に戻し (次 tick で再試行)、
+ *   上限到達なら failed として記録する。
  */
-import type { Db } from "../db.js";
-import { type GeminiClient, SUMMARY_ERROR_PREFIX } from "../services/gemini.js";
-import { GeminiError } from "../services/gemini.js";
+import type { Db, PageStateRow } from "../db.js";
+import { type GeminiClient, GeminiError, SUMMARY_ERROR_PREFIX } from "../services/gemini.js";
 import { NotionApiError, type NotionClient } from "../services/notion.js";
 import { type SlackClient, buildSummaryMessage } from "../services/slack.js";
-import type { AppConfig, SummaryJobMessage } from "../types.js";
+import type { AppConfig } from "../types.js";
 import type { Logger } from "../utils/logger.js";
 
-/** Queue の Message から本実装が使う部分だけを抜き出した最小インターフェース。 */
-export interface QueueMessageLike<T> {
-  body: T;
-  attempts: number;
-  ack(): void;
-  retry(options?: { delaySeconds?: number }): void;
-}
-
-export interface ConsumerDeps {
+export interface ProcessorDeps {
   config: AppConfig;
   db: Db;
   notion: NotionClient;
   gemini: GeminiClient;
   slack: SlackClient;
-  /** debounce / lock 競合時の再投入先 (producer binding)。 */
-  queue: Queue<SummaryJobMessage>;
   now: () => Date;
   logger: Logger;
   maxRetries: number;
   lockTtlSeconds: number;
-  lockRetryDelaySeconds: number;
 }
 
-/** lock 解放後に通常の retry に乗せたい失敗を表す内部エラー。 */
+/** 一時失敗 (retry 対象) を表す内部エラー。 */
 class RetryableError extends Error {}
 
-export async function processMessage(
-  msg: QueueMessageLike<SummaryJobMessage>,
-  deps: ConsumerDeps,
-): Promise<void> {
+/** Cron 1 回分: due なページを取得し、それぞれ処理する。 */
+export async function processDuePages(deps: ProcessorDeps): Promise<void> {
+  const nowIso = deps.now().toISOString();
+  const pages = await deps.db.getDuePages(nowIso, deps.config.cronMaxPages);
+  deps.logger.info("cron tick", { due_pages: pages.length });
+  for (const page of pages) {
+    await processDuePage(page, deps);
+  }
+}
+
+/** 1 ページを要約処理する。lock 取得から完了/スキップ/失敗までを担う。 */
+export async function processDuePage(state: PageStateRow, deps: ProcessorDeps): Promise<void> {
   const { db, notion, gemini, slack, config, logger } = deps;
-  const payload = msg.body;
+  const pageId = state.page_id;
   const nowDate = deps.now();
   const nowIso = nowDate.toISOString();
 
-  const pageId = payload?.page_id;
-  const jobId = payload?.job_id;
-
-  // page_id なし → 失敗として ack。
-  if (!pageId) {
-    logger.warn("queue message without page_id");
-    if (jobId) {
-      await safe(() =>
-        db.updateJobStatus({
-          id: jobId,
-          status: "failed",
-          errorMessage: "no_page_id",
-          now: nowIso,
-        }),
-      );
-    }
-    msg.ack();
+  // processing lock。取得失敗なら別実行が処理中とみなし今回はスキップ (次 tick で再試行)。
+  const lockUntil = new Date(nowDate.getTime() + deps.lockTtlSeconds * 1000).toISOString();
+  const locked = await db.acquireLock({ pageId, now: nowIso, lockUntil });
+  if (!locked) {
+    logger.info("skip: lock held by another run", { page_id: pageId });
     return;
   }
 
-  let lockAcquired = false;
+  const jobId = (await db.getLatestJobByPage(pageId))?.id;
+  let lockAcquired = true;
   try {
     if (jobId) {
       await db.updateJobStatus({ id: jobId, status: "processing", startedAt: nowIso, now: nowIso });
     }
 
-    const state = await db.getPageState(pageId);
-    if (!state) {
-      logger.warn("no page_state for job", { page_id: pageId });
-      await skipJob(deps, jobId, "no_state", nowIso);
-      msg.ack();
-      return;
-    }
-
-    // newer_edit (lock 取得前)。page_state は新しいジョブが所有するので触らない。
-    if (state.latest_last_edited_time !== payload.last_edited_time) {
-      await skipJob(deps, jobId, "newer_edit", nowIso);
-      msg.ack();
-      return;
-    }
-
-    // debounce 中 → 残り秒数で再投入。attempts を消費しないよう新規 send + ack。
-    const debounceUntilMs = Date.parse(state.debounce_until);
-    if (Number.isFinite(debounceUntilMs) && nowDate.getTime() < debounceUntilMs) {
-      const delaySeconds = Math.max(1, Math.ceil((debounceUntilMs - nowDate.getTime()) / 1000));
-      await deps.queue.send(payload, { delaySeconds });
-      if (jobId) await db.updateJobStatus({ id: jobId, status: "queued", now: nowIso });
-      logger.info("requeued for debounce", { page_id: pageId, delaySeconds });
-      msg.ack();
-      return;
-    }
-
-    // processing lock。失敗時は別 consumer が処理中とみなし短時間 delay で再投入。
-    const lockUntil = new Date(nowDate.getTime() + deps.lockTtlSeconds * 1000).toISOString();
-    lockAcquired = await db.acquireLock({ pageId, now: nowIso, lockUntil });
-    if (!lockAcquired) {
-      await deps.queue.send(payload, { delaySeconds: deps.lockRetryDelaySeconds });
-      logger.info("requeued for lock contention", { page_id: pageId });
-      msg.ack();
-      return;
-    }
-
-    // ページ再取得 + 現在の last_edited_time 比較。
-    const info = await notion.getPageInfo(pageId);
-    if (info.lastEditedTime !== payload.last_edited_time) {
+    // ロック取得後に最新の行を読み直す。getDuePages のスナップショット以降に
+    // 新しい Webhook が来て debounce_until が先送りされていたら、まだ編集中とみなしスキップ。
+    const fresh = (await db.getPageState(pageId)) ?? state;
+    if (Date.parse(fresh.debounce_until) > nowDate.getTime()) {
       await db.releaseLock(pageId, nowIso);
       lockAcquired = false;
-      await skipJob(deps, jobId, "newer_edit", nowIso);
-      msg.ack();
+      logger.info("skip: still_editing", { page_id: pageId });
+      return;
+    }
+
+    // ページ取得 (ここで初めて Notion を叩く)。
+    const info = await notion.getPageInfo(pageId);
+
+    // 対象 DB フィルタ (Webhook から Cron へ移動)。
+    if (config.notionDatabaseId) {
+      if (normalizeId(info.parentDatabaseId) !== normalizeId(config.notionDatabaseId)) {
+        await db.markPageStatus({ pageId, status: "skipped", now: nowIso });
+        lockAcquired = false;
+        await skipJob(deps, jobId, "other_database", nowIso);
+        logger.info("skip: other_database", { page_id: pageId });
+        return;
+      }
+    }
+
+    // 重複防止: 前回要約した版と同じ last_edited_time なら、内容が変わっていない → スキップ。
+    if (fresh.latest_last_edited_time && info.lastEditedTime === fresh.latest_last_edited_time) {
+      await db.markPageStatus({ pageId, status: "completed", now: nowIso });
+      lockAcquired = false;
+      await skipJob(deps, jobId, "no_change", nowIso);
+      logger.info("skip: no_change", { page_id: pageId });
       return;
     }
 
     // 本文取得 → 空ならスキップ。
     const content = await notion.getPageContent(pageId);
     if (content.markdown.trim().length === 0) {
-      await db.releaseLock(pageId, nowIso);
+      await db.markPageStatus({ pageId, status: "skipped", now: nowIso });
       lockAcquired = false;
       await skipJob(deps, jobId, "empty_body", nowIso);
-      msg.ack();
+      logger.info("skip: empty_body", { page_id: pageId });
       return;
     }
 
@@ -149,23 +121,25 @@ export async function processMessage(
       if (title) category = title;
     }
 
-    // Gemini 要約。transient は throw され下の catch で retry。
-    const summary = await gemini.summarize({ title: info.title, markdown: content.markdown });
+    // Gemini 要約。transient は throw → 下の catch で retry。
+    const summary = await gemini.summarize({
+      title: info.title,
+      category,
+      markdown: content.markdown,
+    });
     if (summary.startsWith(SUMMARY_ERROR_PREFIX)) {
       // permanent: Slack へ投稿せず failed (spec §20)。
-      await failJob(deps, jobId, pageId, summary, nowIso);
+      await failPage(deps, jobId, pageId, summary, nowIso);
       lockAcquired = false;
-      msg.ack();
       return;
     }
 
-    // Slack 投稿 (チャンネル単位の冪等化, §4-C)。
+    // Slack 投稿 (チャンネル単位の冪等化, 計画 §4-C)。
     const channels = config.slackChannelIds;
     if (channels.length === 0) {
       logger.error("no slack channel configured", { page_id: pageId });
-      await failJob(deps, jobId, pageId, "no_slack_channel", nowIso);
+      await failPage(deps, jobId, pageId, "no_slack_channel", nowIso);
       lockAcquired = false;
-      msg.ack();
       return;
     }
 
@@ -191,11 +165,19 @@ export async function processMessage(
     const successful = { ...already, ...posted };
     const allPosted = channels.every((c) => successful[c]);
     if (!allPosted) {
-      // 一部チャンネル未投稿 → retry (未投稿分は次回送る)。lock は catch で解放。
+      // 未投稿チャンネルが残る → retry (次回は未投稿分のみ送る)。lock は catch で解放。
       throw new RetryableError("slack post incomplete");
     }
 
-    await db.markPageCompleted({ pageId, summary, now: nowIso });
+    // 完了確定。処理中に新しい Webhook で debounce_until が変わっていれば pending のまま残し、
+    // 次の Cron で新しい編集を要約する (markPageCompleted 内の CASE で判定)。
+    await db.markPageCompleted({
+      pageId,
+      lastEditedTime: info.lastEditedTime,
+      summary,
+      expectedDebounceUntil: fresh.debounce_until,
+      now: nowIso,
+    });
     lockAcquired = false;
     if (jobId) {
       await db.updateJobStatus({
@@ -206,50 +188,47 @@ export async function processMessage(
       });
     }
     logger.info("summary completed", { job_id: jobId, page_id: pageId });
-    msg.ack();
   } catch (error) {
-    await handleFailure(error, msg, deps, jobId, pageId, nowIso, lockAcquired);
+    await handleFailure(error, deps, jobId, state, nowIso, lockAcquired);
   }
 }
 
 async function handleFailure(
   error: unknown,
-  msg: QueueMessageLike<SummaryJobMessage>,
-  deps: ConsumerDeps,
+  deps: ProcessorDeps,
   jobId: string | undefined,
-  pageId: string,
+  state: PageStateRow,
   nowIso: string,
   lockAcquired: boolean,
 ): Promise<void> {
-  // lock を解放して次の試行で再取得できるようにする。
+  const pageId = state.page_id;
   if (lockAcquired) await safe(() => deps.db.releaseLock(pageId, nowIso));
 
   const retryable = isRetryable(error);
-  if (retryable && msg.attempts < deps.maxRetries) {
-    deps.logger.warn("retrying job", {
-      job_id: jobId,
+  const willRetry = retryable && state.retry_count + 1 < deps.maxRetries;
+  if (willRetry) {
+    deps.logger.warn("retrying page", {
       page_id: pageId,
-      attempts: msg.attempts,
+      retry_count: state.retry_count,
       error: messageOf(error),
     });
+    // pending に戻し retry_count++。次の Cron tick で再度 due として拾われる。
+    await safe(() => deps.db.bumpRetry(pageId, nowIso, messageOf(error)));
     if (jobId) {
       await safe(() =>
         deps.db.updateJobStatus({
           id: jobId,
           status: "queued",
-          retryCount: msg.attempts,
+          retryCount: state.retry_count + 1,
           now: nowIso,
         }),
       );
     }
-    msg.retry();
     return;
   }
 
-  // 最終試行 or 非 retryable → failed を確実に記録してから ack (§4-B)。
-  deps.logger.error("job failed", { job_id: jobId, page_id: pageId, error: messageOf(error) });
-  await failJob(deps, jobId, pageId, messageOf(error), nowIso);
-  msg.ack();
+  deps.logger.error("page failed", { page_id: pageId, error: messageOf(error) });
+  await failPage(deps, jobId, pageId, messageOf(error), nowIso);
 }
 
 function isRetryable(error: unknown): boolean {
@@ -261,7 +240,7 @@ function isRetryable(error: unknown): boolean {
 }
 
 async function skipJob(
-  deps: ConsumerDeps,
+  deps: ProcessorDeps,
   jobId: string | undefined,
   reason: string,
   nowIso: string,
@@ -272,8 +251,8 @@ async function skipJob(
   );
 }
 
-async function failJob(
-  deps: ConsumerDeps,
+async function failPage(
+  deps: ProcessorDeps,
   jobId: string | undefined,
   pageId: string,
   errorMessage: string,
@@ -304,6 +283,11 @@ async function safe<T>(fn: () => Promise<T>): Promise<T | undefined> {
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** Notion ID をダッシュ除去・小文字化して比較用に正規化する。 */
+function normalizeId(id: string | undefined): string {
+  return id ? id.replace(/-/g, "").toLowerCase() : "";
 }
 
 /** ISO 文字列を JST の "YYYY-MM-DD HH:mm JST" へ整形する。 */

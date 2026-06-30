@@ -21,12 +21,28 @@ function okResponse(text: string) {
 
 describe("buildPrompt", () => {
   it("読者・方針・長さ/形式・本文を含める", () => {
-    const p = buildPrompt({ title: "T", markdown: "本文" }, "short", "paragraph");
+    const p = buildPrompt({ title: "T", markdown: "本文テキスト" }, "short", "paragraph");
     expect(p).toContain("学部生");
     expect(p).toContain("3〜5 文");
     expect(p).toContain("段落形式");
     expect(p).toContain("タイトル: T");
-    expect(p).toContain("本文");
+    expect(p).toContain("本文テキスト");
+  });
+
+  it("忠実性ルールと区切りを含む (ハルシネーション/インジェクション対策)", () => {
+    const p = buildPrompt({ title: "T", markdown: "M" }, "medium", "bullet");
+    expect(p).toContain("創作したりしない");
+    expect(p).toContain("要約できる本文がありません。");
+    expect(p).toContain("-----"); // 入力文書の区切り
+  });
+
+  it("category は指定値を、未指定なら『なし』を入れる", () => {
+    expect(
+      buildPrompt({ title: "T", category: "論文DB", markdown: "M" }, "medium", "bullet"),
+    ).toContain("カテゴリ: 論文DB");
+    expect(buildPrompt({ title: "T", markdown: "M" }, "medium", "bullet")).toContain(
+      "カテゴリ: なし",
+    );
   });
 });
 
@@ -98,5 +114,37 @@ describe("summarize 一時障害は throw (retry 対象)", () => {
     await expect(client.summarize({ title: "T", markdown: "M" })).rejects.toBeInstanceOf(
       GeminiError,
     );
+  });
+
+  it("混雑エラー (high demand) は transient で throw → retry 対象", async () => {
+    const fetchImpl = createFetchMock([
+      {
+        match: (u) => u.includes(":generateContent"),
+        responses: [
+          { status: 503, body: { error: { message: "currently experiencing high demand" } } },
+        ],
+      },
+    ]);
+    const client = new GeminiClient({ ...BASE_OPTS, fetchImpl });
+    await expect(client.summarize({ title: "T", markdown: "M" })).rejects.toMatchObject({
+      kind: "transient",
+    });
+  });
+});
+
+describe("課金切れは即 failed (リトライしない)", () => {
+  it("クレジット切れ (429+billing文言) は throw せず『要約生成エラー:』を返す", async () => {
+    const fetchImpl = createFetchMock([
+      {
+        match: (u) => u.includes(":generateContent"),
+        responses: [
+          { status: 429, body: { error: { message: "Your prepayment credits are depleted." } } },
+        ],
+      },
+    ]);
+    const client = new GeminiClient({ ...BASE_OPTS, fetchImpl });
+    // permanent 扱い → throw されず error 文字列を返す → consumer は retry せず failed にする
+    const out = await client.summarize({ title: "T", markdown: "M" });
+    expect(out.startsWith(SUMMARY_ERROR_PREFIX)).toBe(true);
   });
 });

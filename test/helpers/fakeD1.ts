@@ -60,24 +60,52 @@ class FakeStatement {
       const row = this.d1.jobs.get(this.args[0] as string);
       return (row ?? null) as T | null;
     }
+    if (sql.startsWith("SELECT id FROM summary_jobs WHERE page_id")) {
+      const pageId = this.args[0] as string;
+      // Map は挿入順を保つので、最後にマッチしたものを最新とみなす。
+      let latest: { id: string } | null = null;
+      for (const job of this.d1.jobs.values()) {
+        if (job.page_id === pageId) latest = { id: job.id as string };
+      }
+      return latest as T | null;
+    }
     throw new Error(`FakeD1: unsupported first() query: ${sql}`);
+  }
+
+  async all<T>(): Promise<{ results: T[] }> {
+    const sql = this.sql;
+    if (sql.startsWith("SELECT * FROM page_state WHERE status = 'pending'")) {
+      const [now, , limit] = this.args as [string, string, number];
+      const due = [...this.d1.pageStates.values()]
+        .filter(
+          (r) =>
+            r.status === "pending" &&
+            r.debounce_until <= now &&
+            (r.lock_until === null || r.lock_until < now),
+        )
+        .sort((a, b) => a.debounce_until.localeCompare(b.debounce_until))
+        .slice(0, limit);
+      return { results: due as T[] };
+    }
+    throw new Error(`FakeD1: unsupported all() query: ${sql}`);
   }
 
   async run(): Promise<{ meta: { changes: number } }> {
     const sql = this.sql;
 
     if (sql.startsWith("INSERT INTO page_state")) {
-      const [pageId, latest, debounceUntil, now] = this.args as string[];
+      // 軽量 upsert: bind(pageId, debounceUntil, now)。latest は新規時のみ '' で挿入し、
+      // 既存行では上書きしない。
+      const [pageId, debounceUntil, now] = this.args as string[];
       const existing = this.d1.pageStates.get(pageId);
       if (existing) {
-        existing.latest_last_edited_time = latest;
         existing.debounce_until = debounceUntil;
         existing.status = "pending";
         existing.updated_at = now;
       } else {
         this.d1.pageStates.set(pageId, {
           page_id: pageId,
-          latest_last_edited_time: latest,
+          latest_last_edited_time: "",
           debounce_until: debounceUntil,
           status: "pending",
           lock_until: null,
@@ -114,6 +142,19 @@ class FakeStatement {
       return changes(1);
     }
 
+    if (sql.startsWith("UPDATE page_state SET status = 'pending'")) {
+      // bumpRetry
+      const [errorMessage, now, pageId] = this.args as string[];
+      const row = this.d1.pageStates.get(pageId);
+      if (!row) return changes(0);
+      row.status = "pending";
+      row.lock_until = null;
+      row.retry_count += 1;
+      row.error_message = errorMessage;
+      row.updated_at = now;
+      return changes(1);
+    }
+
     if (sql.startsWith("UPDATE page_state SET slack_ts = ?")) {
       const [slackTs, now, pageId] = this.args as string[];
       const row = this.d1.pageStates.get(pageId);
@@ -123,11 +164,14 @@ class FakeStatement {
       return changes(1);
     }
 
-    if (sql.startsWith("UPDATE page_state SET status = 'completed'")) {
-      const [summary, summarizedAt, now, pageId] = this.args as string[];
+    if (sql.startsWith("UPDATE page_state SET status = CASE WHEN debounce_until")) {
+      // markPageCompleted: bind(expectedDebounceUntil, lastEditedTime, summary, now, now, pageId)
+      const [expected, lastEdited, summary, summarizedAt, now, pageId] = this.args as string[];
       const row = this.d1.pageStates.get(pageId);
       if (!row) return changes(0);
-      row.status = "completed";
+      // 処理中に debounce_until が変わっていたら pending のまま残す。
+      row.status = row.debounce_until === expected ? "completed" : "pending";
+      row.latest_last_edited_time = lastEdited;
       row.last_summary = summary;
       row.last_summarized_at = summarizedAt;
       row.lock_until = null;

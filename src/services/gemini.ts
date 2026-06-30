@@ -37,6 +37,8 @@ export interface GeminiClientOptions {
 
 export interface SummarizeInput {
   title: string;
+  /** 親 DB タイトルなどの分類情報。未指定なら「なし」として扱う。 */
+  category?: string;
   markdown: string;
 }
 
@@ -44,7 +46,9 @@ export class GeminiClient {
   private readonly fetchImpl: typeof fetch;
 
   constructor(private readonly opts: GeminiClientOptions) {
-    this.fetchImpl = opts.fetchImpl ?? fetch;
+    // Workers ではグローバル fetch をメソッド呼び出しすると this がずれて
+    // "Illegal invocation" になるため globalThis に束縛する。
+    this.fetchImpl = opts.fetchImpl ?? fetch.bind(globalThis);
   }
 
   /**
@@ -120,6 +124,11 @@ async function readErrorMessage(res: Response): Promise<string> {
 }
 
 function classifyHttpError(status: number, message: string): GeminiError {
+  // 課金・クレジット切れはリトライしても直らないので即 permanent (無駄な再試行を防ぐ)。
+  // status が 429 でもこちらを優先する。
+  if (isBillingError(message)) {
+    return new GeminiError(message, "permanent", status);
+  }
   if (status === 429 || status >= 500) {
     return new GeminiError(message, "transient", status);
   }
@@ -131,6 +140,13 @@ function classifyHttpError(status: number, message: string): GeminiError {
 
 function isModelUnavailableMessage(message: string): boolean {
   return /not found|deprecated|retired|unsupported|not supported|unavailable/i.test(message);
+}
+
+/** 課金・残高不足系のエラー (リトライ不可)。混雑 ("high demand") はここに含めない。 */
+function isBillingError(message: string): boolean {
+  return /credit|billing|prepay|depleted|insufficient|payment|exceeded your current quota|quota.*exceeded/i.test(
+    message,
+  );
 }
 
 function toGeminiError(error: unknown): GeminiError {
@@ -151,8 +167,11 @@ const STYLE_INSTRUCTION: Record<SummaryStyle, string> = {
   paragraph: "段落形式で出力する。",
 };
 
+/** 入力文書を指示と分離するための区切り (プロンプトインジェクション対策)。 */
+const DOC_DELIMITER = "-----";
+
 /**
- * 要約プロンプトを構築する (spec §12 のプロンプト方針)。
+ * 要約プロンプトを構築する (spec §12 のプロンプト方針 + 忠実性/区切り/エッジ処理を強化)。
  * 読者は「研究室に配属された学部生」。プロンプトは本ファイルに集約する。
  */
 export function buildPrompt(
@@ -160,23 +179,45 @@ export function buildPrompt(
   length: SummaryLength,
   style: SummaryStyle,
 ): string {
+  const category = input.category?.trim() ? input.category.trim() : "なし";
   return [
-    "あなたは技術文書を要約する専門家です。",
-    "読者は研究室に配属されたばかりの学部生です。",
+    "# 役割",
+    "あなたはAI分野の研究室に所属する優秀なリサーチアシスタントです。",
+    "教授が作成した技術文書・研究資料を、指定された読者向けに正確かつ簡潔に要約します。",
     "",
-    "次の方針で要約してください。",
-    "- 技術的詳細を保持する。",
-    "- 新規性・貢献・従来技術との差分を明示する。",
-    "- 重要な略語は初出時に正式名称を併記する。",
-    "- 結論・行動項目・今後の課題を抽出する。",
-    "- 原文の論理構成に沿って整理する。",
-    "- 冒頭の挨拶や導入文は出力しない。",
-    `- ${LENGTH_INSTRUCTION[length]}`,
-    `- ${STYLE_INSTRUCTION[style]}`,
+    "# 対象読者",
+    "研究室に配属されたばかりの学部生（その分野の前提知識は浅い）。",
     "",
+    "# 目的",
+    "長い文書の要点を短時間で把握できるようにする。",
+    "",
+    "# 出力ルール（厳守）",
+    "- 日本語で出力する。",
+    "- 冒頭の挨拶・前置き・「〜をまとめます」等の導入文は書かない。最初の行から要約本文を始める。",
+    "- 【本文】に書かれている情報だけを使う。推測で補ったり、書かれていない事実を創作したりしない。判断できない点は無理に書かない。",
+    "- タイトル・カテゴリは文脈情報として渡すだけ。要約本文の中で繰り返さない。",
+    "- 本文末尾に「[本文が長いため、一部のブロックは省略されています]」がある場合は、取得できた範囲だけで要約する（省略への言及は不要）。",
+    "- 要約できる本文が無い／極端に短い場合は、「要約できる本文がありません。」とだけ出力する。",
+    "",
+    "# 要約の方針",
+    "1. 技術的詳細の保持: 提案手法の核心、実験設定、主要な結果（重要な数値・傾向）など、理解に不可欠な詳細は省略しない。",
+    "2. 新規性・貢献の明示: 「最も重要な貢献(Contribution)」と「従来手法との違い」が一読で分かるようにする。",
+    "3. 専門用語・略語: 専門用語はそのまま使う。重要な略語(Acronym)の初出時のみ正式名称を（）で併記する。",
+    "4. 結論と次の一手: 文書の結論、今後の課題、（あれば）次に取るべき行動を明確に抽出する。",
+    "5. 論理構成の踏襲: 可能な限り原文の構成（背景・目的 → 手法 → 結果 → 考察 等）に沿って整理する。",
+    "6. 密度: 冗長な言い換えや一般論は避け、情報量の多い文にする。",
+    "",
+    "# 出力形式",
+    `- 長さ: ${LENGTH_INSTRUCTION[length]}`,
+    `- 形式: ${STYLE_INSTRUCTION[style]}`,
+    "",
+    "# 入力文書",
     `タイトル: ${input.title}`,
-    "",
-    "本文 (Markdown):",
+    `カテゴリ: ${category}`,
+    DOC_DELIMITER,
     input.markdown,
+    DOC_DELIMITER,
+    "",
+    `上記の入力文書を、方針と出力形式に従って${STYLE_INSTRUCTION[style]}`,
   ].join("\n");
 }

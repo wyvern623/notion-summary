@@ -8,6 +8,7 @@ const DEFAULTS = {
   notionVersion: "2022-06-28",
   notionEventTypes: "page.content_updated,page.created",
   summaryDelaySeconds: 600,
+  summaryMinIntervalSeconds: 1800,
   geminiModel: "gemini-2.5-flash-lite",
   summaryLength: "medium" as SummaryLength,
   summaryStyle: "bullet" as SummaryStyle,
@@ -17,7 +18,8 @@ const DEFAULTS = {
   notionMaxMarkdownChars: 30000,
   debugVerbose: false,
   logLevel: "INFO" as LogLevel,
-  queueMaxRetries: 3,
+  summaryMaxRetries: 3,
+  cronMaxPages: 3,
 } as const;
 
 const VALID_LENGTHS: readonly SummaryLength[] = ["short", "medium", "long"];
@@ -63,6 +65,10 @@ export function loadConfig(env: Env): AppConfig {
     notionDatabaseId: env.NOTION_DATABASE_ID?.trim() || undefined,
     notionEventTypes: eventTypes.length > 0 ? eventTypes : parseCsv(DEFAULTS.notionEventTypes),
     summaryDelaySeconds: parsePositiveInt(env.SUMMARY_DELAY_SECONDS, DEFAULTS.summaryDelaySeconds),
+    summaryMinIntervalSeconds: parsePositiveInt(
+      env.SUMMARY_MIN_INTERVAL_SECONDS,
+      DEFAULTS.summaryMinIntervalSeconds,
+    ),
     geminiModel: env.GEMINI_MODEL?.trim() || DEFAULTS.geminiModel,
     summaryLength,
     summaryStyle,
@@ -78,7 +84,8 @@ export function loadConfig(env: Env): AppConfig {
     ),
     debugVerbose: parseBool(env.DEBUG_VERBOSE, DEFAULTS.debugVerbose),
     logLevel,
-    queueMaxRetries: parsePositiveInt(env.QUEUE_MAX_RETRIES, DEFAULTS.queueMaxRetries),
+    summaryMaxRetries: parsePositiveInt(env.SUMMARY_MAX_RETRIES, DEFAULTS.summaryMaxRetries),
+    cronMaxPages: parsePositiveInt(env.CRON_MAX_PAGES, DEFAULTS.cronMaxPages),
     notionApiToken: env.NOTION_API_TOKEN,
     notionWebhookToken: env.NOTION_WEBHOOK_TOKEN,
     geminiApiKey: env.GEMINI_API_KEY,

@@ -1,31 +1,32 @@
 /**
- * POST /notion/webhook ハンドラ (spec §6 / 計画 §4-A)。
+ * POST /notion/webhook ハンドラ (軽量構成 / spec §6 + 計画 §4-A)。
  *
- * 重要な順序 (計画 §4-A):
+ * Webhook は「素早く受理して記録するだけ」に徹する (Notion API を叩かない)。
+ * 重い処理 (ページ取得・DBフィルタ・要約・Slack) はすべて Cron 側 (consumer) で行う。
+ * これにより Notion の配信タイムアウトによる Canceled や D1 競合を避ける。
+ *
+ * 順序:
  *   1. raw body を 1 回だけ読む (request.json() は使わない)。
  *   2. JSON parse。
  *   3. verification_token を含めば初回ハンドシェイクとして 200 (署名検証不要)。
  *   4. それ以外は署名必須。NOTION_WEBHOOK_TOKEN 未設定なら fail-closed で 500。
- *   5. 署名検証 → 対象判定 → ページ取得 → DB フィルタ → D1 upsert → Queue 投入。
+ *   5. 対象イベント/ページ判定 → D1 に debounce 状態を記録 (pending) + 履歴。
  */
 import type { Db } from "../db.js";
-import type { NotionClient } from "../services/notion.js";
-import type { AppConfig, SummaryJobMessage } from "../types.js";
+import type { AppConfig } from "../types.js";
 import { verifyNotionSignature } from "../utils/crypto.js";
 import type { Logger } from "../utils/logger.js";
 
 export interface WebhookDeps {
   config: AppConfig;
   db: Db;
-  notion: NotionClient;
-  queue: Queue<SummaryJobMessage>;
   now: () => Date;
   uuid: () => string;
   logger: Logger;
 }
 
 export async function handleWebhook(request: Request, deps: WebhookDeps): Promise<Response> {
-  const { config, db, notion, queue, logger } = deps;
+  const { config, db, logger } = deps;
 
   // 1. raw body を 1 回だけ読む。
   const raw = await request.text();
@@ -61,7 +62,7 @@ export async function handleWebhook(request: Request, deps: WebhookDeps): Promis
     return json({ error: "invalid signature" }, 401);
   }
 
-  // 5. 対象イベント判定。
+  // 5. 対象イベント/ページ判定 (Notion API は叩かない)。
   const eventType = typeof payload.type === "string" ? payload.type : "";
   if (!config.notionEventTypes.includes(eventType)) {
     return json({ ok: true, skipped: "event_type" }, 200);
@@ -76,43 +77,33 @@ export async function handleWebhook(request: Request, deps: WebhookDeps): Promis
     return json({ ok: true, skipped: "no_page_id" }, 200);
   }
 
-  // ページ取得。
-  let pageInfo: Awaited<ReturnType<NotionClient["getPageInfo"]>>;
-  try {
-    pageInfo = await notion.getPageInfo(pageId);
-  } catch (error) {
-    logger.warn("page fetch failed", { page_id: pageId, error: messageOf(error) });
-    return json({ ok: true, skipped: "page_fetch_failed" }, 200);
-  }
-
-  // 対象 DB フィルタ。
-  if (config.notionDatabaseId) {
-    if (normalizeId(pageInfo.parentDatabaseId) !== normalizeId(config.notionDatabaseId)) {
-      return json({ ok: true, skipped: "other_database" }, 200);
-    }
-  }
-
   const nowDate = deps.now();
   const nowIso = nowDate.toISOString();
-  const debounceUntil = new Date(
-    nowDate.getTime() + config.summaryDelaySeconds * 1000,
-  ).toISOString();
-  const lastEditedTime = pageInfo.lastEditedTime;
   const jobId = deps.uuid();
 
-  // D1 更新 (page_state upsert + summary_jobs 履歴)。
+  // D1 更新 (debounce 状態を pending で記録 + summary_jobs 履歴)。
+  // 実処理 (ページ取得・DBフィルタ・要約) は Cron。
   try {
-    await db.upsertPageState({
-      pageId,
-      latestLastEditedTime: lastEditedTime,
-      debounceUntil,
-      now: nowIso,
-    });
+    // 要約実行時刻 = max(最後の編集 + デバウンス, 前回要約 + クールダウン)。
+    //  - デバウンス: 編集が止まってから summaryDelaySeconds 後に要約。
+    //  - クールダウン: 前回要約から summaryMinIntervalSeconds は次の要約を出さない。
+    const existing = await db.getPageState(pageId);
+    let debounceMs = nowDate.getTime() + config.summaryDelaySeconds * 1000;
+    if (existing?.last_summarized_at) {
+      const cooldownEnd =
+        Date.parse(existing.last_summarized_at) + config.summaryMinIntervalSeconds * 1000;
+      if (Number.isFinite(cooldownEnd) && cooldownEnd > debounceMs) {
+        debounceMs = cooldownEnd;
+      }
+    }
+    const debounceUntil = new Date(debounceMs).toISOString();
+
+    await db.upsertPageState({ pageId, debounceUntil, now: nowIso });
     await db.insertJob({
       id: jobId,
       pageId,
       eventType,
-      payloadLastEditedTime: lastEditedTime,
+      payloadLastEditedTime: null,
       status: "queued",
       queuedAt: nowIso,
       now: nowIso,
@@ -122,22 +113,7 @@ export async function handleWebhook(request: Request, deps: WebhookDeps): Promis
     return json({ error: "db_error" }, 500);
   }
 
-  // Queue 投入 (delaySeconds 付き)。
-  const message: SummaryJobMessage = {
-    job_id: jobId,
-    page_id: pageId,
-    event_type: eventType,
-    last_edited_time: lastEditedTime,
-    queued_at: nowIso,
-  };
-  try {
-    await queue.send(message, { delaySeconds: config.summaryDelaySeconds });
-  } catch (error) {
-    logger.error("queue send failed", { page_id: pageId, error: messageOf(error) });
-    return json({ error: "queue_error" }, 500);
-  }
-
-  logger.info("webhook queued", { job_id: jobId, page_id: pageId, event_type: eventType });
+  logger.info("webhook accepted", { job_id: jobId, page_id: pageId, event_type: eventType });
   return json({ ok: true }, 200);
 }
 
@@ -150,10 +126,6 @@ function json(body: unknown, status: number): Response {
 
 function asObject(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" ? (value as Record<string, unknown>) : null;
-}
-
-function normalizeId(id: string | undefined): string {
-  return id ? id.replace(/-/g, "").toLowerCase() : "";
 }
 
 function messageOf(error: unknown): string {

@@ -1,68 +1,38 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { loadConfig } from "../src/config.js";
 import { Db } from "../src/db.js";
 import { type WebhookDeps, handleWebhook } from "../src/handlers/webhook.js";
-import { NotionClient } from "../src/services/notion.js";
-import type { Env, SummaryJobMessage } from "../src/types.js";
+import type { Env } from "../src/types.js";
 import { computeHmacSha256Hex } from "../src/utils/crypto.js";
 import { createLogger } from "../src/utils/logger.js";
 import { FakeD1 } from "./helpers/fakeD1.js";
-import { FakeQueue } from "./helpers/fakeQueue.js";
-import { type Route, createFetchMock } from "./helpers/fetchMock.js";
 
 const TOKEN = "whsec";
 const NOW = new Date("2026-06-06T10:00:05.000Z");
 
 interface Ctx {
   fake: FakeD1;
-  queue: FakeQueue<SummaryJobMessage>;
   deps: WebhookDeps;
 }
 
-function buildCtx(options: {
-  envOverrides?: Partial<Env>;
-  notionRoutes?: Route[];
-}): Ctx {
+/** 軽量 Webhook は Notion を叩かないので D1 だけで完結する。 */
+function buildCtx(envOverrides: Partial<Env> = {}): Ctx {
   const env = {
     DB: {} as Env["DB"],
-    SUMMARY_QUEUE: {} as Env["SUMMARY_QUEUE"],
     NOTION_WEBHOOK_TOKEN: TOKEN,
-    NOTION_API_TOKEN: "notion",
     SUMMARY_DELAY_SECONDS: "600",
-    ...options.envOverrides,
+    ...envOverrides,
   } as Env;
   const config = loadConfig(env);
-
   const fake = new FakeD1();
-  const queue = new FakeQueue<SummaryJobMessage>();
-  const notion = new NotionClient({
-    token: "notion",
-    notionVersion: config.notionVersion,
-    pageSize: 100,
-    maxBlockFetches: 40,
-    maxBlocks: 800,
-    maxMarkdownChars: 30000,
-    fetchImpl: options.notionRoutes
-      ? createFetchMock(options.notionRoutes)
-      : (createFetchMock([
-          { match: () => true, responses: [{ status: 500, body: {} }] },
-        ]) as typeof fetch),
-  });
-
   const deps: WebhookDeps = {
     config,
     db: new Db(fake.asD1()),
-    notion,
-    queue: queue.asQueue(),
     now: () => NOW,
     uuid: () => "job-fixed",
     logger: createLogger("ERROR"),
   };
-  return { fake, queue, deps };
-}
-
-function pageRoute(body: Record<string, unknown>): Route {
-  return { match: (u) => u.includes("/v1/pages/"), responses: [{ body }] };
+  return { fake, deps };
 }
 
 async function makeRequest(payload: unknown, opts: { sign?: boolean } = {}): Promise<Request> {
@@ -79,17 +49,9 @@ const VALID_EVENT = {
   entity: { type: "page", id: "page-1" },
 };
 
-const PAGE_BODY = {
-  id: "page-1",
-  url: "https://notion.so/page-1",
-  last_edited_time: "2026-06-06T09:59:00.000Z",
-  parent: { type: "database_id", database_id: "db-1" },
-  properties: { Name: { type: "title", title: [{ plain_text: "T" }] } },
-};
-
 describe("入力検証", () => {
   it("JSON 不正は 400", async () => {
-    const { deps } = buildCtx({});
+    const { deps } = buildCtx();
     const req = new Request("https://worker/notion/webhook", { method: "POST", body: "{not json" });
     const res = await handleWebhook(req, deps);
     expect(res.status).toBe(400);
@@ -97,7 +59,7 @@ describe("入力検証", () => {
   });
 
   it("verification_token は 200 {ok:true} (署名不要)", async () => {
-    const { deps } = buildCtx({});
+    const { deps } = buildCtx();
     const res = await handleWebhook(await makeRequest({ verification_token: "tok" }), deps);
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true });
@@ -106,14 +68,14 @@ describe("入力検証", () => {
 
 describe("署名検証 (fail-closed)", () => {
   it("NOTION_WEBHOOK_TOKEN 未設定の通常イベントは 500 (fail-closed)", async () => {
-    const { deps } = buildCtx({ envOverrides: { NOTION_WEBHOOK_TOKEN: undefined } });
+    const { deps } = buildCtx({ NOTION_WEBHOOK_TOKEN: undefined });
     const res = await handleWebhook(await makeRequest(VALID_EVENT, { sign: false }), deps);
     expect(res.status).toBe(500);
     expect(await res.json()).toEqual({ error: "webhook_not_configured" });
   });
 
   it("署名不一致は 401", async () => {
-    const { deps } = buildCtx({});
+    const { deps } = buildCtx();
     const raw = JSON.stringify(VALID_EVENT);
     const req = new Request("https://worker/notion/webhook", {
       method: "POST",
@@ -126,9 +88,9 @@ describe("署名検証 (fail-closed)", () => {
   });
 });
 
-describe("対象判定", () => {
-  it("対象外イベントは skipped event_type, Queue 投入なし", async () => {
-    const { deps, queue } = buildCtx({});
+describe("対象判定 (Notion は叩かない)", () => {
+  it("対象外イベントは skipped event_type, D1 更新なし", async () => {
+    const { deps, fake } = buildCtx();
     const res = await handleWebhook(
       await makeRequest(
         { type: "page.deleted", entity: { type: "page", id: "p" } },
@@ -137,11 +99,11 @@ describe("対象判定", () => {
       deps,
     );
     expect(await res.json()).toEqual({ ok: true, skipped: "event_type" });
-    expect(queue.sent).toHaveLength(0);
+    expect(fake.pageStates.size).toBe(0);
   });
 
   it("ページ以外は skipped non_page", async () => {
-    const { deps } = buildCtx({});
+    const { deps } = buildCtx();
     const res = await handleWebhook(
       await makeRequest(
         { type: "page.content_updated", entity: { type: "database", id: "d" } },
@@ -152,56 +114,78 @@ describe("対象判定", () => {
     expect(await res.json()).toEqual({ ok: true, skipped: "non_page" });
   });
 
-  it("ページ取得失敗は skipped page_fetch_failed", async () => {
-    const { deps } = buildCtx({}); // notionRoutes 未指定 = 500 を返す
-    const res = await handleWebhook(await makeRequest(VALID_EVENT, { sign: true }), deps);
-    expect(await res.json()).toEqual({ ok: true, skipped: "page_fetch_failed" });
-  });
-
-  it("対象 DB 外は skipped other_database", async () => {
-    const { deps, queue } = buildCtx({
-      envOverrides: { NOTION_DATABASE_ID: "db-OTHER" },
-      notionRoutes: [pageRoute(PAGE_BODY)],
-    });
-    const res = await handleWebhook(await makeRequest(VALID_EVENT, { sign: true }), deps);
-    expect(await res.json()).toEqual({ ok: true, skipped: "other_database" });
-    expect(queue.sent).toHaveLength(0);
+  it("page ID なしは skipped no_page_id", async () => {
+    const { deps } = buildCtx();
+    const res = await handleWebhook(
+      await makeRequest({ type: "page.content_updated", entity: { type: "page" } }, { sign: true }),
+      deps,
+    );
+    expect(await res.json()).toEqual({ ok: true, skipped: "no_page_id" });
   });
 });
 
 describe("正常系", () => {
-  let ctx: Ctx;
-  beforeEach(() => {
-    ctx = buildCtx({ notionRoutes: [pageRoute(PAGE_BODY)] });
-  });
-
-  it("D1 に page_state と job が保存され、Queue に delay 付きで投入される", async () => {
-    const res = await handleWebhook(await makeRequest(VALID_EVENT, { sign: true }), ctx.deps);
+  it("D1 に page_state(pending, debounce_until) と job が記録される (Notion 非依存)", async () => {
+    const { deps, fake } = buildCtx();
+    const res = await handleWebhook(await makeRequest(VALID_EVENT, { sign: true }), deps);
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true });
 
-    const state = ctx.fake.pageStates.get("page-1");
-    expect(state?.latest_last_edited_time).toBe("2026-06-06T09:59:00.000Z");
+    const state = fake.pageStates.get("page-1");
     expect(state?.status).toBe("pending");
-    // debounce_until = now + 600s
+    // debounce_until = now + 600s。Cron がこの時刻を過ぎたら処理する。
     expect(state?.debounce_until).toBe("2026-06-06T10:10:05.000Z");
-
-    expect(ctx.fake.jobs.get("job-fixed")?.status).toBe("queued");
-
-    expect(ctx.queue.sent).toHaveLength(1);
-    expect(ctx.queue.sent[0].options?.delaySeconds).toBe(600);
-    expect(ctx.queue.sent[0].body).toMatchObject({
-      job_id: "job-fixed",
-      page_id: "page-1",
-      event_type: "page.content_updated",
-      last_edited_time: "2026-06-06T09:59:00.000Z",
-    });
+    expect(state?.latest_last_edited_time).toBe(""); // 版は Cron 要約時に記録
+    expect(fake.jobs.get("job-fixed")?.status).toBe("queued");
   });
 
-  it("Queue 投入失敗は 500 queue_error", async () => {
-    ctx.queue.failSend = true;
-    const res = await handleWebhook(await makeRequest(VALID_EVENT, { sign: true }), ctx.deps);
+  it("D1 更新失敗は 500 db_error", async () => {
+    const { deps } = buildCtx();
+    deps.db.upsertPageState = async () => {
+      throw new Error("d1 down");
+    };
+    const res = await handleWebhook(await makeRequest(VALID_EVENT, { sign: true }), deps);
     expect(res.status).toBe(500);
-    expect(await res.json()).toEqual({ error: "queue_error" });
+    expect(await res.json()).toEqual({ error: "db_error" });
+  });
+});
+
+describe("クールダウン (再要約間隔)", () => {
+  // NOW = 2026-06-06T10:00:05Z, delay=600s → 通常 debounce = 10:10:05
+  function seedSummarized(ctx: Ctx, lastSummarizedAt: string) {
+    ctx.fake.pageStates.set("page-1", {
+      page_id: "page-1",
+      latest_last_edited_time: "2026-06-06T08:00:00.000Z",
+      debounce_until: "2026-06-06T09:00:00.000Z",
+      status: "completed",
+      lock_until: null,
+      last_summarized_at: lastSummarizedAt,
+      last_summary: "前回の要約",
+      slack_ts: null,
+      retry_count: 0,
+      error_message: null,
+      created_at: "x",
+      updated_at: "x",
+    });
+  }
+
+  it("前回要約が最近なら debounce_until = 前回要約 + 30分 (クールダウン優先)", async () => {
+    const ctx = buildCtx();
+    seedSummarized(ctx, "2026-06-06T09:50:00.000Z"); // +30分 = 10:20:00 > 10:10:05
+    await handleWebhook(await makeRequest(VALID_EVENT, { sign: true }), ctx.deps);
+    expect(ctx.fake.pageStates.get("page-1")?.debounce_until).toBe("2026-06-06T10:20:00.000Z");
+  });
+
+  it("前回要約が十分前なら通常デバウンス (now + 10分)", async () => {
+    const ctx = buildCtx();
+    seedSummarized(ctx, "2026-06-06T09:00:00.000Z"); // +30分 = 09:30:00 < 10:10:05
+    await handleWebhook(await makeRequest(VALID_EVENT, { sign: true }), ctx.deps);
+    expect(ctx.fake.pageStates.get("page-1")?.debounce_until).toBe("2026-06-06T10:10:05.000Z");
+  });
+
+  it("初回 (要約履歴なし) は通常デバウンス", async () => {
+    const ctx = buildCtx();
+    await handleWebhook(await makeRequest(VALID_EVENT, { sign: true }), ctx.deps);
+    expect(ctx.fake.pageStates.get("page-1")?.debounce_until).toBe("2026-06-06T10:10:05.000Z");
   });
 });

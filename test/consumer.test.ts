@@ -1,30 +1,21 @@
 import { describe, expect, it } from "vitest";
-import { Db } from "../src/db.js";
-import { type ConsumerDeps, formatJst, processMessage } from "../src/handlers/consumer.js";
+import { Db, type PageStateRow } from "../src/db.js";
+import {
+  type ProcessorDeps,
+  formatJst,
+  processDuePage,
+  processDuePages,
+} from "../src/handlers/consumer.js";
 import { GeminiClient } from "../src/services/gemini.js";
 import { NotionClient } from "../src/services/notion.js";
 import { SlackClient } from "../src/services/slack.js";
-import type { SummaryJobMessage } from "../src/types.js";
 import { createLogger } from "../src/utils/logger.js";
 import { FakeD1 } from "./helpers/fakeD1.js";
-import { FakeMessage } from "./helpers/fakeMessage.js";
-import { FakeQueue } from "./helpers/fakeQueue.js";
 import { type Route, createFetchMock } from "./helpers/fetchMock.js";
 
 const PAGE_ID = "page-1";
-const LET = "2026-06-06T09:59:00.000Z"; // last_edited_time
+const LET = "2026-06-06T09:59:00.000Z"; // Notion が返す現在の last_edited_time
 const NOW = new Date("2026-06-06T10:11:00.000Z"); // debounce 後
-
-function payload(overrides: Partial<SummaryJobMessage> = {}): SummaryJobMessage {
-  return {
-    job_id: "job-1",
-    page_id: PAGE_ID,
-    event_type: "page.content_updated",
-    last_edited_time: LET,
-    queued_at: "2026-06-06T10:00:05.000Z",
-    ...overrides,
-  };
-}
 
 const PAGE_ROUTE: Route = {
   match: (u) => u.includes("/v1/pages/"),
@@ -60,38 +51,44 @@ const GEMINI_OK: Route = {
   match: (u) => u.includes(":generateContent"),
   responses: [{ body: { candidates: [{ content: { parts: [{ text: "要約結果" }] } }] } }],
 };
+const SLACK_OK: Route = {
+  match: (u) => u.includes("chat.postMessage"),
+  responses: [{ body: { ok: true, ts: "1.1" } }],
+};
 
 interface Ctx {
   fake: FakeD1;
   db: Db;
-  queue: FakeQueue<SummaryJobMessage>;
-  deps: ConsumerDeps;
+  deps: ProcessorDeps;
 }
 
 function buildCtx(options: {
   routes: Route[];
   channels?: string[];
   now?: Date;
+  notionDatabaseId?: string;
 }): Ctx {
   const fetchImpl = createFetchMock(options.routes) as typeof fetch;
   const fake = new FakeD1();
   const db = new Db(fake.asD1());
-  const queue = new FakeQueue<SummaryJobMessage>();
-  const deps: ConsumerDeps = {
+  const deps: ProcessorDeps = {
     config: {
       notionVersion: "2022-06-28",
+      notionDatabaseId: options.notionDatabaseId,
       notionEventTypes: ["page.content_updated"],
       summaryDelaySeconds: 600,
+      summaryMinIntervalSeconds: 1800,
       geminiModel: "gemini-2.5-flash-lite",
       summaryLength: "medium",
       summaryStyle: "bullet",
       notionPageSize: 100,
-      notionMaxBlockFetches: 40,
+      notionMaxBlockFetches: 30,
       notionMaxBlocks: 800,
       notionMaxMarkdownChars: 30000,
       debugVerbose: false,
       logLevel: "ERROR",
-      queueMaxRetries: 3,
+      summaryMaxRetries: 3,
+      cronMaxPages: 3,
       slackChannelIds: options.channels ?? ["C1"],
     },
     db,
@@ -99,7 +96,7 @@ function buildCtx(options: {
       token: "n",
       notionVersion: "2022-06-28",
       pageSize: 100,
-      maxBlockFetches: 40,
+      maxBlockFetches: 30,
       maxBlocks: 800,
       maxMarkdownChars: 30000,
       fetchImpl,
@@ -113,39 +110,42 @@ function buildCtx(options: {
       fetchImpl,
     }),
     slack: new SlackClient("t", fetchImpl),
-    queue: queue.asQueue(),
     now: () => options.now ?? NOW,
     logger: createLogger("ERROR"),
     maxRetries: 3,
     lockTtlSeconds: 120,
-    lockRetryDelaySeconds: 15,
   };
-  return { fake, db, queue, deps };
+  return { fake, db, deps };
 }
 
 function seedState(
   fake: FakeD1,
   overrides: Partial<{
+    pageId: string;
     latest: string;
     debounceUntil: string;
     lockUntil: string | null;
     slackTs: string | null;
+    retryCount: number;
   }> = {},
-): void {
-  fake.pageStates.set(PAGE_ID, {
-    page_id: PAGE_ID,
-    latest_last_edited_time: overrides.latest ?? LET,
-    debounce_until: overrides.debounceUntil ?? "2026-06-06T10:10:00.000Z", // 過去
+): PageStateRow {
+  const row: PageStateRow = {
+    page_id: overrides.pageId ?? PAGE_ID,
+    // latest = 「前回要約した版」。デフォルトは空 (未要約) なので要約対象になる。
+    latest_last_edited_time: overrides.latest ?? "",
+    debounce_until: overrides.debounceUntil ?? "2026-06-06T10:10:00.000Z", // 過去 = due
     status: "pending",
     lock_until: overrides.lockUntil ?? null,
     last_summarized_at: null,
     last_summary: null,
     slack_ts: overrides.slackTs ?? null,
-    retry_count: 0,
+    retry_count: overrides.retryCount ?? 0,
     error_message: null,
     created_at: "x",
     updated_at: "x",
-  });
+  };
+  fake.pageStates.set(row.page_id, row);
+  return row;
 }
 
 describe("formatJst", () => {
@@ -154,86 +154,86 @@ describe("formatJst", () => {
   });
 });
 
-describe("newer_edit スキップ", () => {
-  it("payload と D1 の last_edited_time が異なれば Slack 投稿しない", async () => {
-    const ctx = buildCtx({ routes: [PAGE_ROUTE, DB_ROUTE, BLOCKS_ROUTE, GEMINI_OK] });
-    seedState(ctx.fake, { latest: "2026-06-06T10:30:00.000Z" }); // payload より新しい
-    const msg = new FakeMessage(payload());
-    await processMessage(msg, ctx.deps);
-    expect(msg.acked).toBe(true);
-    expect(ctx.fake.jobs.get("job-1")).toBeUndefined(); // updateJobStatus は insert しない
-    expect(ctx.queue.sent).toHaveLength(0);
-  });
-});
-
-describe("debounce 中の再投入", () => {
-  it("debounce_until より前なら残り秒数 delay で再 Queue", async () => {
-    const ctx = buildCtx({
-      routes: [PAGE_ROUTE],
-      now: new Date("2026-06-06T10:05:00.000Z"),
-    });
-    seedState(ctx.fake, { debounceUntil: "2026-06-06T10:10:00.000Z" });
-    const msg = new FakeMessage(payload());
-    await processMessage(msg, ctx.deps);
-    expect(msg.acked).toBe(true);
-    expect(ctx.queue.sent).toHaveLength(1);
-    expect(ctx.queue.sent[0].options?.delaySeconds).toBe(300);
+describe("processDuePages (Cron tick)", () => {
+  it("due なページだけ処理する", async () => {
+    const ctx = buildCtx({ routes: [PAGE_ROUTE, DB_ROUTE, BLOCKS_ROUTE, GEMINI_OK, SLACK_OK] });
+    seedState(ctx.fake); // due
+    seedState(ctx.fake, { pageId: "page-2", debounceUntil: "2026-06-06T23:00:00.000Z" }); // not due
+    await processDuePages(ctx.deps);
+    expect(ctx.fake.pageStates.get(PAGE_ID)?.status).toBe("completed");
+    expect(ctx.fake.pageStates.get("page-2")?.status).toBe("pending");
   });
 });
 
 describe("lock 競合", () => {
-  it("ロック取得失敗なら短時間 delay で再投入し二重投稿しない", async () => {
-    const ctx = buildCtx({ routes: [PAGE_ROUTE, DB_ROUTE, BLOCKS_ROUTE, GEMINI_OK] });
-    // 既に未失効ロックが存在 (now=10:11 < lock_until=10:12)
-    seedState(ctx.fake, { lockUntil: "2026-06-06T10:12:00.000Z" });
-    const msg = new FakeMessage(payload());
-    await processMessage(msg, ctx.deps);
-    expect(msg.acked).toBe(true);
-    expect(ctx.queue.sent).toHaveLength(1);
-    expect(ctx.queue.sent[0].options?.delaySeconds).toBe(15);
+  it("ロック取得失敗なら何もしない", async () => {
+    const ctx = buildCtx({ routes: [PAGE_ROUTE, DB_ROUTE, BLOCKS_ROUTE, GEMINI_OK, SLACK_OK] });
+    const state = seedState(ctx.fake, { lockUntil: "2026-06-06T10:12:00.000Z" });
+    await processDuePage(state, ctx.deps);
+    expect(ctx.fake.pageStates.get(PAGE_ID)?.status).not.toBe("completed");
+    expect(ctx.fake.pageStates.get(PAGE_ID)?.slack_ts).toBeNull();
+  });
+});
+
+describe("still_editing スキップ", () => {
+  it("ロック後の再読み込みで debounce_until が未来なら処理しない", async () => {
+    const ctx = buildCtx({ routes: [PAGE_ROUTE, DB_ROUTE, BLOCKS_ROUTE, GEMINI_OK, SLACK_OK] });
+    const state = seedState(ctx.fake, { debounceUntil: "2026-06-06T10:20:00.000Z" }); // now より後
+    await processDuePage(state, ctx.deps);
+    expect(ctx.fake.pageStates.get(PAGE_ID)?.status).not.toBe("completed");
+  });
+});
+
+describe("no_change スキップ (重複防止)", () => {
+  it("前回要約した版と現在の last_edited_time が同じなら Slack 投稿しない", async () => {
+    const ctx = buildCtx({ routes: [PAGE_ROUTE, DB_ROUTE, BLOCKS_ROUTE, GEMINI_OK, SLACK_OK] });
+    const state = seedState(ctx.fake, { latest: LET }); // = Notion の現在値
+    await processDuePage(state, ctx.deps);
+    const row = ctx.fake.pageStates.get(PAGE_ID);
+    expect(row?.slack_ts).toBeNull();
+    expect(row?.status).toBe("completed"); // 既に要約済み版なので completed のまま
+  });
+});
+
+describe("対象 DB フィルタ (Cron 側)", () => {
+  it("親 DB が NOTION_DATABASE_ID と異なれば other_database でスキップ", async () => {
+    const ctx = buildCtx({
+      routes: [PAGE_ROUTE, BLOCKS_ROUTE, GEMINI_OK, SLACK_OK],
+      notionDatabaseId: "db-OTHER",
+    });
+    const state = seedState(ctx.fake);
+    await processDuePage(state, ctx.deps);
+    expect(ctx.fake.pageStates.get(PAGE_ID)?.status).toBe("skipped");
+    expect(ctx.fake.pageStates.get(PAGE_ID)?.slack_ts).toBeNull();
   });
 });
 
 describe("正常系", () => {
-  it("要約して Slack 投稿し completed にする", async () => {
-    const ctx = buildCtx({
-      routes: [
-        PAGE_ROUTE,
-        DB_ROUTE,
-        BLOCKS_ROUTE,
-        GEMINI_OK,
-        {
-          match: (u) => u.includes("chat.postMessage"),
-          responses: [{ body: { ok: true, ts: "1.1" } }],
-        },
-      ],
-    });
-    seedState(ctx.fake);
-    const msg = new FakeMessage(payload());
-    await processMessage(msg, ctx.deps);
-    expect(msg.acked).toBe(true);
-    const state = ctx.fake.pageStates.get(PAGE_ID);
-    expect(state?.status).toBe("completed");
-    expect(state?.last_summary).toBe("要約結果");
-    expect(JSON.parse(state?.slack_ts ?? "{}")).toEqual({ C1: "1.1" });
+  it("要約して Slack 投稿し completed、版を記録する", async () => {
+    const ctx = buildCtx({ routes: [PAGE_ROUTE, DB_ROUTE, BLOCKS_ROUTE, GEMINI_OK, SLACK_OK] });
+    const state = seedState(ctx.fake);
+    await processDuePage(state, ctx.deps);
+    const row = ctx.fake.pageStates.get(PAGE_ID);
+    expect(row?.status).toBe("completed");
+    expect(row?.last_summary).toBe("要約結果");
+    expect(row?.latest_last_edited_time).toBe(LET); // 要約した版を記録
+    expect(JSON.parse(row?.slack_ts ?? "{}")).toEqual({ C1: "1.1" });
   });
 
-  it("本文が空なら empty_body でスキップ", async () => {
+  it("本文が空なら skipped", async () => {
     const emptyBlocks: Route = {
       match: (u) => u.includes("/children"),
       responses: [{ body: { results: [], has_more: false, next_cursor: null } }],
     };
     const ctx = buildCtx({ routes: [PAGE_ROUTE, emptyBlocks] });
-    seedState(ctx.fake);
-    const msg = new FakeMessage(payload());
-    await processMessage(msg, ctx.deps);
-    expect(msg.acked).toBe(true);
-    expect(ctx.fake.pageStates.get(PAGE_ID)?.status).not.toBe("completed");
+    const state = seedState(ctx.fake);
+    await processDuePage(state, ctx.deps);
+    expect(ctx.fake.pageStates.get(PAGE_ID)?.status).toBe("skipped");
   });
 });
 
 describe("Slack 冪等性", () => {
-  it("一部チャンネル失敗で retry、成功分は再送しない", async () => {
+  it("一部チャンネル失敗で retry(pending)、成功分は再送しない", async () => {
     const ctx = buildCtx({
       channels: ["C1", "C2"],
       routes: [
@@ -244,25 +244,23 @@ describe("Slack 冪等性", () => {
         {
           match: (u) => u.includes("chat.postMessage"),
           responses: [
-            { body: { ok: true, ts: "1.1" } }, // C1 成功
-            { body: { ok: false, error: "channel_error" } }, // C2 失敗
+            { body: { ok: true, ts: "1.1" } },
+            { body: { ok: false, error: "channel_error" } },
           ],
         },
       ],
     });
-    seedState(ctx.fake);
-    const msg = new FakeMessage(payload(), 1);
-    await processMessage(msg, ctx.deps);
-    // 未完了 → retry
-    expect(msg.retried).toBe(true);
-    expect(msg.acked).toBe(false);
-    // 成功した C1 は記録済み (次回再送しない)
-    expect(JSON.parse(ctx.fake.pageStates.get(PAGE_ID)?.slack_ts ?? "{}")).toEqual({ C1: "1.1" });
+    const state = seedState(ctx.fake);
+    await processDuePage(state, ctx.deps);
+    const row = ctx.fake.pageStates.get(PAGE_ID);
+    expect(row?.status).toBe("pending");
+    expect(row?.retry_count).toBe(1);
+    expect(JSON.parse(row?.slack_ts ?? "{}")).toEqual({ C1: "1.1" });
   });
 });
 
 describe("Gemini エラー", () => {
-  it("transient (429) は retry される (attempts<max)", async () => {
+  it("transient(429) は retry(pending, retry_count++)", async () => {
     const ctx = buildCtx({
       routes: [
         PAGE_ROUTE,
@@ -271,16 +269,15 @@ describe("Gemini エラー", () => {
         { match: (u) => u.includes(":generateContent"), responses: [{ status: 429, body: {} }] },
       ],
     });
-    seedState(ctx.fake);
-    const msg = new FakeMessage(payload(), 1);
-    await processMessage(msg, ctx.deps);
-    expect(msg.retried).toBe(true);
-    expect(msg.acked).toBe(false);
-    // lock は解放されている
-    expect(ctx.fake.pageStates.get(PAGE_ID)?.lock_until).toBeNull();
+    const state = seedState(ctx.fake);
+    await processDuePage(state, ctx.deps);
+    const row = ctx.fake.pageStates.get(PAGE_ID);
+    expect(row?.status).toBe("pending");
+    expect(row?.retry_count).toBe(1);
+    expect(row?.lock_until).toBeNull();
   });
 
-  it("最大リトライ到達時は failed を記録して ack", async () => {
+  it("retry 上限到達なら failed", async () => {
     const ctx = buildCtx({
       routes: [
         PAGE_ROUTE,
@@ -289,15 +286,12 @@ describe("Gemini エラー", () => {
         { match: (u) => u.includes(":generateContent"), responses: [{ status: 503, body: {} }] },
       ],
     });
-    seedState(ctx.fake);
-    const msg = new FakeMessage(payload(), 3); // attempts == maxRetries
-    await processMessage(msg, ctx.deps);
-    expect(msg.acked).toBe(true);
-    expect(msg.retried).toBe(false);
+    const state = seedState(ctx.fake, { retryCount: 2 });
+    await processDuePage(state, ctx.deps);
     expect(ctx.fake.pageStates.get(PAGE_ID)?.status).toBe("failed");
   });
 
-  it("permanent (モデル不可) は Slack 投稿せず failed", async () => {
+  it("permanent(モデル不可) は Slack 投稿せず failed", async () => {
     const ctx = buildCtx({
       routes: [
         PAGE_ROUTE,
@@ -309,21 +303,10 @@ describe("Gemini エラー", () => {
         },
       ],
     });
-    seedState(ctx.fake);
-    const msg = new FakeMessage(payload());
-    await processMessage(msg, ctx.deps);
-    expect(msg.acked).toBe(true);
-    expect(ctx.fake.pageStates.get(PAGE_ID)?.status).toBe("failed");
-    expect(ctx.fake.pageStates.get(PAGE_ID)?.slack_ts).toBeNull(); // 投稿していない
-  });
-});
-
-describe("page_id なし", () => {
-  it("failed として ack する", async () => {
-    const ctx = buildCtx({ routes: [PAGE_ROUTE] });
-    const msg = new FakeMessage(payload({ page_id: "" }));
-    await processMessage(msg, ctx.deps);
-    expect(msg.acked).toBe(true);
-    expect(msg.retried).toBe(false);
+    const state = seedState(ctx.fake);
+    await processDuePage(state, ctx.deps);
+    const row = ctx.fake.pageStates.get(PAGE_ID);
+    expect(row?.status).toBe("failed");
+    expect(row?.slack_ts).toBeNull();
   });
 });

@@ -36,7 +36,9 @@ export class SlackClient {
     private readonly token: string,
     fetchImpl?: typeof fetch,
   ) {
-    this.fetchImpl = fetchImpl ?? fetch;
+    // Workers ではグローバル fetch をメソッド呼び出しすると this がずれて
+    // "Illegal invocation" になるため globalThis に束縛する。
+    this.fetchImpl = fetchImpl ?? fetch.bind(globalThis);
   }
 
   /** 1 チャンネルへ投稿する。例外は握りつぶさず結果オブジェクトへ写す (握りつぶし禁止に対応)。 */

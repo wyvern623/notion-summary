@@ -2,11 +2,10 @@ import { describe, expect, it } from "vitest";
 import { DEFAULTS, loadConfig, parseCsv } from "../src/config.js";
 import type { Env } from "../src/types.js";
 
-/** D1 / Queue は config では使わないので最小スタブで足りる。 */
+/** D1 は config では使わないので最小スタブで足りる。 */
 function makeEnv(overrides: Partial<Env> = {}): Env {
   return {
     DB: {} as D1Database,
-    SUMMARY_QUEUE: {} as Queue,
     ...overrides,
   } as Env;
 }
@@ -28,6 +27,7 @@ describe("loadConfig defaults", () => {
     const c = loadConfig(makeEnv());
     expect(c.notionVersion).toBe(DEFAULTS.notionVersion);
     expect(c.summaryDelaySeconds).toBe(600);
+    expect(c.summaryMinIntervalSeconds).toBe(1800);
     expect(c.geminiModel).toBe("gemini-2.5-flash-lite");
     expect(c.summaryLength).toBe("medium");
     expect(c.summaryStyle).toBe("bullet");
@@ -37,7 +37,8 @@ describe("loadConfig defaults", () => {
     expect(c.notionMaxMarkdownChars).toBe(30000);
     expect(c.logLevel).toBe("INFO");
     expect(c.debugVerbose).toBe(false);
-    expect(c.queueMaxRetries).toBe(3);
+    expect(c.summaryMaxRetries).toBe(3);
+    expect(c.cronMaxPages).toBe(3);
     expect(c.notionEventTypes).toEqual(["page.content_updated", "page.created"]);
     expect(c.notionDatabaseId).toBeUndefined();
   });

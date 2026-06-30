@@ -1,21 +1,20 @@
 /**
- * Worker entrypoint。
+ * Worker entrypoint (無料構成: Cron + D1)。
  * - fetch: GET / (ヘルスチェック) と POST /notion/webhook を提供する。
- * - queue: 要約ジョブの consumer (Step 11 で実装)。
+ * - scheduled: Cron Trigger で due なページを拾い要約処理する (Queue の代替)。
  */
 import { loadConfig } from "./config.js";
 import { Db } from "./db.js";
-import { type ConsumerDeps, processMessage } from "./handlers/consumer.js";
+import { type ProcessorDeps, processDuePages } from "./handlers/consumer.js";
 import { type WebhookDeps, handleWebhook } from "./handlers/webhook.js";
 import { GeminiClient } from "./services/gemini.js";
 import { NotionClient } from "./services/notion.js";
 import { SlackClient } from "./services/slack.js";
-import type { AppConfig, Env, SummaryJobMessage } from "./types.js";
+import type { AppConfig, Env } from "./types.js";
 import { createLogger } from "./utils/logger.js";
 
 const DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-lite";
 const LOCK_TTL_SECONDS = 120;
-const LOCK_RETRY_DELAY_SECONDS = 15;
 
 function buildNotionClient(config: AppConfig): NotionClient {
   return new NotionClient({
@@ -42,8 +41,6 @@ export default {
       const deps: WebhookDeps = {
         config,
         db: new Db(env.DB),
-        notion: buildNotionClient(config),
-        queue: env.SUMMARY_QUEUE,
         now: () => new Date(),
         uuid: () => crypto.randomUUID(),
         logger,
@@ -54,10 +51,14 @@ export default {
     return new Response("not found", { status: 404 });
   },
 
-  async queue(batch: MessageBatch<SummaryJobMessage>, env: Env): Promise<void> {
+  async scheduled(
+    _controller: ScheduledController,
+    env: Env,
+    ctx: ExecutionContext,
+  ): Promise<void> {
     const config = loadConfig(env);
     const logger = createLogger(config.logLevel);
-    const deps: ConsumerDeps = {
+    const deps: ProcessorDeps = {
       config,
       db: new Db(env.DB),
       notion: buildNotionClient(config),
@@ -69,15 +70,11 @@ export default {
         style: config.summaryStyle,
       }),
       slack: new SlackClient(config.slackBotToken ?? ""),
-      queue: env.SUMMARY_QUEUE,
       now: () => new Date(),
       logger,
-      maxRetries: config.queueMaxRetries,
+      maxRetries: config.summaryMaxRetries,
       lockTtlSeconds: LOCK_TTL_SECONDS,
-      lockRetryDelaySeconds: LOCK_RETRY_DELAY_SECONDS,
     };
-    for (const message of batch.messages) {
-      await processMessage(message, deps);
-    }
+    ctx.waitUntil(processDuePages(deps));
   },
-} satisfies ExportedHandler<Env, SummaryJobMessage>;
+} satisfies ExportedHandler<Env>;

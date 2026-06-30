@@ -216,34 +216,49 @@ npm run typecheck  # tsc --noEmit
 npm test           # Vitest (外部APIはモック)
 ```
 
+### アーキテクチャ (無料構成)
+
+Cloudflare Queues は Workers Paid プラン必須のため、本実装では **Queues を使わず Cron Trigger + D1 ポーリング**で遅延実行を実現している(**Workers Free で動作**)。
+
+```txt
+[Notion Webhook] → [Worker fetch] → D1 page_state を pending + debounce_until 記録
+[Cron Trigger 毎分] → [Worker scheduled] → debounce_until を過ぎた pending ページを D1 から取得 → 要約 → Slack
+```
+
+- デバウンス: Webhook は `debounce_until = 受信時刻 + SUMMARY_DELAY_SECONDS` を記録するだけ。Cron がその時刻を過ぎたページだけ処理する。
+- 再試行: Queue の自動リトライの代わりに D1 `retry_count` を使い、失敗時は `pending` に戻して次の Cron tick で再処理。`SUMMARY_MAX_RETRIES` 到達で `failed`。
+- 同時実行排他: `page_state.lock_until` の processing lock(TTL 120秒)。
+
 ### 初回 Cloudflare セットアップ
 
 ```bash
-npx wrangler d1 create notion-summarizer-db        # 出力された database_id を wrangler.toml に設定
-npx wrangler queues create notion-summary-queue
-npx wrangler d1 migrations apply notion-summarizer-db
+npx wrangler d1 create notion-summarizer-db          # 出力された database_id を wrangler.toml に設定
+npx wrangler d1 migrations apply notion-summarizer-db --remote   # 本番D1へスキーマ適用
+# (ローカル dev 用にスキーマを入れる場合は --local)
 
 npx wrangler secret put NOTION_API_TOKEN
 npx wrangler secret put NOTION_WEBHOOK_TOKEN
 npx wrangler secret put GEMINI_API_KEY
 npx wrangler secret put SLACK_BOT_TOKEN
 npx wrangler secret put SLACK_SUMMARY_CHANNEL_ID
+
+npx wrangler deploy   # Cron Trigger も自動登録される
 ```
 
-詳細な仕様は [docs/spec.md](docs/spec.md) を参照。
+Queue の作成は不要(Cron 構成のため)。詳細な仕様は [docs/spec.md](docs/spec.md) を参照(spec は Queues 版を記載。本実装は Cron 版に置換)。
 
 ### ディレクトリ構成
 
 ```txt
 src/
-  index.ts              # Worker entrypoint (fetch ルーティング + queue consumer)
+  index.ts              # Worker entrypoint (fetch ルーティング + scheduled/Cron)
   config.ts             # env からの設定読み込み・デフォルト適用
-  types.ts              # 共有型 (Env / Queue payload など)
-  db.ts                 # D1 リポジトリ (page_state / summary_jobs / lock)
+  types.ts              # 共有型 (Env など)
+  db.ts                 # D1 リポジトリ (page_state / summary_jobs / lock / getDuePages)
   markdown.ts           # Notion ブロック → Markdown 変換
   handlers/
-    webhook.ts          # POST /notion/webhook
-    consumer.ts         # 要約ジョブ処理
+    webhook.ts          # POST /notion/webhook (pending を D1 に記録)
+    consumer.ts         # Cron 駆動の要約処理 (processDuePages)
   services/
     notion.ts           # Notion API クライアント
     gemini.ts           # Gemini 要約
@@ -252,7 +267,7 @@ src/
     crypto.ts           # Webhook 署名検証 (HMAC-SHA256)
     logger.ts           # 構造化ログ
 migrations/0001_init.sql  # D1 スキーマ
-test/                     # Vitest (fetch / D1 / Queue をモック)
+test/                     # Vitest (fetch / D1 をモック)
 ```
 
 ### 実装上の前提・判断
@@ -260,11 +275,12 @@ test/                     # Vitest (fetch / D1 / Queue をモック)
 仕様書で明示されていない箇所は以下の判断で実装している (後から変更可能)。
 
 * **Webhook 署名は fail-closed**: `NOTION_WEBHOOK_TOKEN` 未設定の通常イベントはスキップせず `500` を返す。署名検証は raw body に対して行う。初回 verification ハンドシェイクのみ未設定でも `200`。
-* **Gemini は REST `generateContent`** を `fetch` で直接呼ぶ (SDK 不使用)。一時障害 (429/5xx) は Queue retry、モデル不可は既定モデルへフォールバック、fallback 不可は `要約生成エラー:` を返し Slack へ投稿せず `failed` 記録。
+* **Gemini は REST `generateContent`** を `fetch` で直接呼ぶ (SDK 不使用)。一時障害 (429/5xx) は再試行、モデル不可は既定モデルへフォールバック、fallback 不可は `要約生成エラー:` を返し Slack へ投稿せず `failed` 記録。
 * **Slack の「カテゴリ」= 親 DB タイトル** (無ければ「未分類」)、「更新日時」= `last_edited_time` の JST 表記。
-* **processing lock の TTL = 120 秒**、lock 競合時の再投入 delay = 15 秒 (`src/index.ts` の定数)。
+* **processing lock の TTL = 120 秒** (`src/index.ts` の定数)。
 * **Slack はチャンネル単位で冪等化**: 投稿成功チャンネルを `page_state.slack_ts` (channel→ts JSON) に記録し、retry 時は未投稿チャンネルのみ送る。全チャンネル成功で `completed`。
-* **retry は `message.attempts` で制御**: `maxRetries` (wrangler.toml の consumer 設定と一致) 未満なら `retry()`、最終試行で `failed` を記録して `ack`。
+* **retry は D1 `retry_count` で制御**: `SUMMARY_MAX_RETRIES` 未満なら `pending` に戻して次の Cron tick で再処理、上限到達で `failed`。
+* **無料枠対策**: Workers Free の subrequest 上限(1実行50)に収めるため `NOTION_MAX_BLOCK_FETCHES=30`、1 tick の処理ページ数 `CRON_MAX_PAGES=3`。デバウンス精度は Cron の最小粒度=1分。
 
 ## License
 

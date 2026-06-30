@@ -47,7 +47,9 @@ export class NotionClient {
   private readonly fetchImpl: typeof fetch;
 
   constructor(private readonly opts: NotionClientOptions) {
-    this.fetchImpl = opts.fetchImpl ?? fetch;
+    // Workers ではグローバル fetch をメソッド呼び出しすると this がずれて
+    // "Illegal invocation" になるため globalThis に束縛する。
+    this.fetchImpl = opts.fetchImpl ?? fetch.bind(globalThis);
   }
 
   private async request<T>(path: string): Promise<T> {
