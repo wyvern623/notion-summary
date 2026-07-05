@@ -13,7 +13,7 @@ import { SlackClient } from "./services/slack.js";
 import type { AppConfig, Env } from "./types.js";
 import { createLogger } from "./utils/logger.js";
 
-const DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-lite";
+const DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite";
 const LOCK_TTL_SECONDS = 120;
 
 function buildNotionClient(config: AppConfig): NotionClient {

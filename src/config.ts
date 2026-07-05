@@ -9,7 +9,7 @@ const DEFAULTS = {
   notionEventTypes: "page.content_updated,page.created",
   summaryDelaySeconds: 600,
   summaryMinIntervalSeconds: 1800,
-  geminiModel: "gemini-2.5-flash-lite",
+  geminiModel: "gemini-3.1-flash-lite",
   summaryLength: "medium" as SummaryLength,
   summaryStyle: "bullet" as SummaryStyle,
   notionPageSize: 100,

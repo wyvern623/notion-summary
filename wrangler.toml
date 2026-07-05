@@ -15,12 +15,10 @@ preview_urls = false
 NOTION_VERSION = "2022-06-28"
 NOTION_EVENT_TYPES = "page.content_updated,page.created"
 # デバウンス: 最後の編集から 600 秒 (10分) 通知が無ければ要約
-# ※動作確認のため一時的に 10 秒に設定中。確認後 "600" に戻すこと。
-SUMMARY_DELAY_SECONDS = "10"
+SUMMARY_DELAY_SECONDS = "600"
 # クールダウン: 前回要約から 1800 秒 (30分) は次の要約を出さない
-# ※動作確認のため一時的に 30 秒に設定中。確認後 "1800" に戻すこと。
-SUMMARY_MIN_INTERVAL_SECONDS = "30"
-GEMINI_MODEL = "gemini-2.5-flash-lite"
+SUMMARY_MIN_INTERVAL_SECONDS = "1800"
+GEMINI_MODEL = "gemini-3.1-flash-lite"
 SUMMARY_LENGTH = "medium"
 SUMMARY_STYLE = "bullet"
 # 無料 (Workers Free) 前提で subrequest 上限 (1実行50) に収めるため控えめに設定

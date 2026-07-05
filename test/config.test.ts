@@ -28,7 +28,7 @@ describe("loadConfig defaults", () => {
     expect(c.notionVersion).toBe(DEFAULTS.notionVersion);
     expect(c.summaryDelaySeconds).toBe(600);
     expect(c.summaryMinIntervalSeconds).toBe(1800);
-    expect(c.geminiModel).toBe("gemini-2.5-flash-lite");
+    expect(c.geminiModel).toBe("gemini-3.1-flash-lite");
     expect(c.summaryLength).toBe("medium");
     expect(c.summaryStyle).toBe("bullet");
     expect(c.notionPageSize).toBe(100);
