@@ -36,6 +36,18 @@ describe("buildPrompt", () => {
     expect(p).toContain("-----"); // 入力文書の区切り
   });
 
+  it("重要度を出すための構成ルール (要点/太字/重複排除) を含む", () => {
+    const p = buildPrompt({ title: "T", markdown: "M" }, "medium", "bullet");
+    expect(p).toContain("要点"); // 先頭に要点ブロック
+    expect(p).toContain("**太字**"); // 重要語句の強調
+    expect(p).toContain("重複を避ける"); // 冗長・重複の排除
+  });
+
+  it("medium は重複を避けた短めの指示になっている", () => {
+    const p = buildPrompt({ title: "T", markdown: "M" }, "medium", "bullet");
+    expect(p).toContain("6〜8 項目");
+  });
+
   it("category は指定値を、未指定なら『なし』を入れる", () => {
     expect(
       buildPrompt({ title: "T", category: "論文DB", markdown: "M" }, "medium", "bullet"),
